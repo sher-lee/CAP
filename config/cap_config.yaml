@@ -1,0 +1,250 @@
+# =============================================================================
+# CAP Configuration — cap_config.yaml
+# =============================================================================
+# All configurable constants for the Cytology Analysis Project.
+# No magic numbers in code — every tunable value lives here.
+#
+# Values marked "TBD" require empirical determination on real hardware.
+# Set them to reasonable placeholder values for simulation mode;
+# tune them during Phase 10 (hardware bring-up).
+#
+# This file is loaded once at startup by config_loader.py and made
+# available to all layers as a typed CAPConfig object.
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+hardware_mode: simulation      # "simulation" for Windows dev; "real" on Jetson
+
+
+# ---------------------------------------------------------------------------
+# Simulation (only used when hardware_mode == simulation)
+# ---------------------------------------------------------------------------
+sim:
+  camera_test_image_dir: ./tests/test_images/
+  motor_delay_ms: 10           # Simulated motor movement delay (0 for instant)
+  generate_synthetic: true     # Generate procedural test patterns if no test images found
+  synthetic_image_width: 3840
+  synthetic_image_height: 2160
+
+
+# ---------------------------------------------------------------------------
+# Motor control (Layer 1)
+# ---------------------------------------------------------------------------
+motor:
+  protocol: gpio               # "gpio" (step/dir), "uart", or "i2c" — TBD on hardware
+  microsteps: 256              # TMC2209 maximum
+  motor_current_ma: 700        # NEMA 11 rated current; set via TMC2209 UART at startup
+  speed: 1000                  # Steps per second (constant for prototype) — TBD
+
+  # Software boundary limits (microsteps) — TBD on hardware
+  x_min: 0
+  x_max: 100000
+  y_min: 0
+  y_max: 100000
+  z_min: 0
+  z_max: 10000
+
+  # Z-axis
+  z_full_range_degrees: 1.0    # Full usable range of fine focus dial rotation
+  z_step_size_microns: 0.5     # Microns per Z step — TBD (must span ~4 focal planes in 6 steps)
+  settle_delay_ms: 100         # Milliseconds between motor stop and capture — TBD (critical)
+
+  # Homing
+  homing_speed: 500            # Steps per second during homing — TBD
+  stallguard_threshold: 50     # TMC2209 StallGuard sensitivity — TBD
+
+  # Coordinate calibration (set during initial hardware calibration routine)
+  x_steps_per_mm: 1000.0       # TBD — measured with stage micrometer
+  y_steps_per_mm: 1000.0       # TBD — measured with stage micrometer
+  x_origin: 0                  # Home position offset relative to slide edge
+  y_origin: 0                  # Home position offset relative to slide edge
+
+
+# ---------------------------------------------------------------------------
+# Camera (Layer 2)
+# ---------------------------------------------------------------------------
+camera:
+  exposure: 10000              # Manual exposure time (microseconds) — TBD
+  gain: 0.0                    # Manual gain (dB, 0–24) — TBD
+  white_balance_rgb:           # Manual white balance coefficients — TBD
+    r: 1.0
+    g: 1.0
+    b: 1.0
+  trigger_mode: hardware       # "hardware" (GPIO trigger) or "software"
+  bayer_pattern: RG             # Bayer pattern: RG, BG, GR, GB (VEN-830 uses RG)
+  bit_depth: 10                # 8 (RG8) or 10 (RG10)
+
+  # Field of view (calculated from sensor size / magnification) — TBD
+  fov_width_mm: 0.007          # ~7 microns at 1000x with 2.0um pixels and 3840px width
+  fov_height_mm: 0.004         # ~4 microns at 1000x
+
+
+# ---------------------------------------------------------------------------
+# Focus stacking and autofocus (Layer 1 + Layer 2)
+# ---------------------------------------------------------------------------
+focus:
+  z_depths_per_field: 6        # Number of Z-depth captures per field
+  block_size: 16               # Focus stacking block size in pixels (16–32; TBD empirically)
+  blend_sigma: 4.0             # Gaussian blending sigma at block boundaries
+  max_registration_shift: 50   # Max pixel shift for Z-stack registration; larger = capture error
+  sharpness_metric: laplacian  # "laplacian" (primary) or "brenner" (fallback)
+
+  # Preliminary focus
+  coarse_sweep_steps: 20       # Number of Z positions in coarse sweep
+  fine_sweep_steps: 10         # Number of Z positions in fine sweep
+  focus_map_grid:              # Grid size for preliminary focus sampling
+    rows: 3
+    cols: 3
+  drift_threshold: 200         # Max Z deviation (microsteps) from focus map before flagging — TBD
+
+  # Surface fitting
+  surface_fit_order: 2         # Polynomial order for focus surface (2 = quadratic)
+
+
+# ---------------------------------------------------------------------------
+# Scan region (Layer 1)
+# ---------------------------------------------------------------------------
+scan_region:
+  default_preset: null         # null = require manual drawing; or "full_slide", "center_half"
+  oil_safety_brightness_threshold: 0.3  # Fractional brightness deviation to trigger oil safety warning — TBD
+
+
+# ---------------------------------------------------------------------------
+# Slide dimensions (for scan region coordinate mapping)
+# ---------------------------------------------------------------------------
+slide:
+  width_mm: 75.0               # Standard microscope slide
+  height_mm: 25.0              # Standard microscope slide
+
+
+# ---------------------------------------------------------------------------
+# Scan sequencing (Layer 2)
+# ---------------------------------------------------------------------------
+scan:
+  fields_per_second: 2         # Baseline target (upgradable to 3 via config change only)
+  max_capture_retries: 3       # Retries before marking a field as failed
+  serpentine_enabled: true     # Serpentine raster pattern (minimizes travel distance)
+
+
+# ---------------------------------------------------------------------------
+# Image processing (Layer 3)
+# ---------------------------------------------------------------------------
+processing:
+  noise_filter_type: gaussian  # "gaussian" or "median"
+  noise_filter_kernel: 3       # Kernel size (must be odd: 3, 5, 7)
+  model_input_width: 640       # Resize width for YOLOv11 input
+  model_input_height: 640      # Resize height for YOLOv11 input
+
+
+# ---------------------------------------------------------------------------
+# AI inference (Layer 4)
+# ---------------------------------------------------------------------------
+inference:
+  enabled: true                # Set to false to run in AI-disabled mode
+  model_path: ./models/current.pt
+  confidence_threshold: 0.5    # Minimum confidence to keep a detection
+  nms_iou_threshold: 0.45      # IoU threshold for non-maximum suppression
+  batch_size: 16               # Images per inference batch
+
+  # Detection classes (must match model training)
+  classes:
+    - cocci_small
+    - cocci_large
+    - yeast
+    - rods
+    - ear_mites
+    - empty_artifact
+
+  # Severity thresholds per class: [1+, 2+, 3+, 4+] boundaries
+  # Count in range [0, threshold_1) = 0 (none)
+  # Count in range [threshold_1, threshold_2) = 1+ (rare)
+  # etc.
+  severity_thresholds:
+    default: [1, 5, 15, 30]
+    cocci_small: [1, 5, 15, 30]
+    cocci_large: [1, 5, 15, 30]
+    yeast: [1, 5, 15, 30]
+    rods: [1, 3, 10, 20]
+    ear_mites: [1, 2, 5, 10]   # Rare finding; lower thresholds
+
+
+# ---------------------------------------------------------------------------
+# Data storage (Layer 5)
+# ---------------------------------------------------------------------------
+storage:
+  db_path: ./data/cap.db
+  image_root: ./data/slides/
+  raw_format: tiff             # 16-bit TIFF for retraining fidelity
+  stacked_format: jpeg         # JPEG quality 95 for stacked composites
+  stacked_jpeg_quality: 95     # Visually lossless; ~6x smaller than PNG
+  raw_retention_days: 7        # Auto-delete raw Bayer frames after N days
+  max_disk_usage_gb: 400       # Warn technician if disk usage exceeds this
+  backup_target_path: null     # USB drive or network share path — TBD for clinic
+
+
+# ---------------------------------------------------------------------------
+# Visualization (Layer 7)
+# ---------------------------------------------------------------------------
+visualization:
+  stitch_overlap_px: 50        # Pixel overlap between adjacent fields for alignment
+  tile_size: 256               # DZI tile pyramid tile size in pixels
+  annotation_colors:           # Colorblind-friendly palette for organism bounding boxes
+    cocci_small: "#E8593C"     # Coral
+    cocci_large: "#D85A30"     # Dark coral
+    yeast: "#1D9E75"           # Teal
+    rods: "#378ADD"            # Blue
+    ear_mites: "#D4537E"       # Pink
+    empty_artifact: "#888780"  # Gray
+
+
+# ---------------------------------------------------------------------------
+# Exam room transfer (Layer 7)
+# ---------------------------------------------------------------------------
+transfer:
+  protocol: smb_share          # "smb_share" or "local_copy" for development
+  target_path: null            # Network share path, e.g. //exam-room-pc/cap_reports/ — TBD
+  fallback_local_path: ./data/exports/reports/  # Local fallback if network unavailable
+
+
+# ---------------------------------------------------------------------------
+# Metrics and reporting (Layer 8)
+# ---------------------------------------------------------------------------
+metrics:
+  export_format: pdf           # "pdf" or "excel"
+  chart_library: matplotlib    # "matplotlib" or "plotly"
+
+
+# ---------------------------------------------------------------------------
+# Thermal monitoring
+# ---------------------------------------------------------------------------
+thermal:
+  warn_temp_c: 85              # Log warning if junction temp exceeds this
+  pause_temp_c: 95             # Pause scan if junction temp exceeds this
+  check_interval_sec: 5        # How often to poll thermal zones
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  log_dir: ./logs
+  console_level: DEBUG         # DEBUG for development; INFO for production
+  file_level: DEBUG            # Always DEBUG for full diagnostic trail
+  max_bytes: 10485760          # 10 MB per log file
+  backup_count: 5              # Keep 5 rotated backups
+  log_filename: cap.log
+
+
+# ---------------------------------------------------------------------------
+# UI (Layer 6)
+# ---------------------------------------------------------------------------
+ui:
+  framework: PySide6           # PySide6 (LGPL) — do not change without license review
+  preview_resolution:          # Reduced resolution for live camera preview (performance)
+    width: 960
+    height: 540
+  theme: system                # "system" (follow OS), "light", or "dark"
+  language: en                 # Future: localization support
