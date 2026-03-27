@@ -21,7 +21,7 @@ from cap.common.backend import get_backend, Backend
 
 
 def main(config_path: str | None = None) -> None:
-    """
+    
     Application startup sequence.
 
     Follows the order defined in the spec:
@@ -36,7 +36,7 @@ def main(config_path: str | None = None) -> None:
     ----------
     config_path : str, optional
         Path to cap_config.yaml. If None, uses the default location.
-    """
+    
     # Step 1: Load configuration
     config = load_config(config_path)
 
