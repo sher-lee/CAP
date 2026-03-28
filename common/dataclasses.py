@@ -200,18 +200,21 @@ class SlideResults:
     slide_id: int
     organism_counts: dict[str, int]
     """Per-class total detection counts, e.g. {'cocci_small': 42, 'yeast': 17}."""
-    severity_grades: dict[str, SeverityGrade]
-    """Per-class severity grade, e.g. {'cocci_small': SeverityGrade.MODERATE}."""
-    overall_severity: SeverityGrade
-    """Highest severity grade across all organism classes."""
-    flagged_field_ids: list[int]
+    severity_grades: Optional[dict[str, SeverityGrade]] = None
+    """Per-class severity grade, e.g. {'cocci_small': SeverityGrade.MODERATE}.
+    None in AI-disabled mode (no model loaded)."""
+    overall_severity: Optional[SeverityGrade] = None
+    """Highest severity grade across all organism classes.
+    None in AI-disabled mode."""
+    flagged_field_ids: list[int] = field(default_factory=list)
     """Field IDs flagged for high density or rare findings."""
     density_map: Optional[np.ndarray] = None
     """2D array of detection density per slide region, shape (grid_y, grid_x)."""
     model_version: str = ""
     """Model version that produced these results."""
-    plain_english_summary: str = ""
-    """Auto-generated summary, e.g. 'Moderate yeast infection (2+) with occasional cocci (1+).'"""
+    plain_english_summary: Optional[str] = None
+    """Auto-generated summary, e.g. 'Moderate yeast infection (2+) with occasional cocci (1+).'
+    None in AI-disabled mode."""
 
 
 # ---------------------------------------------------------------------------
