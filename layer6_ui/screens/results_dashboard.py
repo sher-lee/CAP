@@ -1,9 +1,10 @@
-
 """
 Screen 4: Results Dashboard
 ===============================
 Displays slide summary with organism counts, severity grades,
 and plain-English summary. Shows field thumbnails and a slide map.
+
+Receives inference results via InferenceSignals or loads from DB.
 """
 
 from __future__ import annotations
@@ -46,6 +47,13 @@ class ResultsDashboardScreen(QWidget):
         title.setStyleSheet("font-size: 22px; font-weight: bold;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
+
+        # AI status banner (hidden by default)
+        self._ai_banner = QLabel("")
+        self._ai_banner.setWordWrap(True)
+        self._ai_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._ai_banner.setVisible(False)
+        layout.addWidget(self._ai_banner)
 
         # Summary section
         summary_group = QGroupBox("Slide Summary")
@@ -128,11 +136,88 @@ class ResultsDashboardScreen(QWidget):
         if slide_id:
             self._load_results(slide_id)
 
+    # -------------------------------------------------------------------
+    # Signal handlers (connected by scan_control after inference)
+    # -------------------------------------------------------------------
+
+    def on_inference_complete(self, slide_id: int, slide_results) -> None:
+        """
+        Called when InferenceWorker finishes.
+        Refreshes the display with live results from the SlideResults object.
+        """
+        self._ai_banner.setVisible(False)
+        self._display_slide_results(slide_results)
+        logger.info("Results dashboard updated from live inference: slide %d", slide_id)
+
+    def on_inference_skipped(self, reason: str) -> None:
+        """
+        Called when inference is skipped (AI-disabled mode).
+        Shows a banner and displays image-only results.
+        """
+        self._ai_banner.setText(
+            f"AI analysis was not available ({reason}). "
+            f"Images were captured successfully and can be reviewed manually."
+        )
+        self._ai_banner.setStyleSheet(
+            "background-color: #FFF3CD; color: #856404; padding: 10px; "
+            "border: 1px solid #FFEEBA; border-radius: 4px; font-size: 13px;"
+        )
+        self._ai_banner.setVisible(True)
+
+        self._summary_label.setText("No AI analysis available — manual review recommended.")
+        self._severity_label.setText("")
+        self._counts_table.setRowCount(0)
+        logger.info("Results dashboard: inference skipped — %s", reason)
+
+    # -------------------------------------------------------------------
+    # Data display
+    # -------------------------------------------------------------------
+
+    def _display_slide_results(self, slide_results) -> None:
+        """Display a SlideResults object directly (from live inference)."""
+        # Summary
+        if slide_results.plain_english_summary is not None:
+            self._summary_label.setText(slide_results.plain_english_summary)
+        else:
+            self._summary_label.setText("Scan complete — no organisms detected.")
+
+        # Overall severity
+        if slide_results.overall_severity is not None:
+            severity_val = slide_results.overall_severity.value
+            self._severity_label.setText(f"Overall severity: {severity_val}")
+        else:
+            self._severity_label.setText("Overall severity: N/A")
+
+        # Organism counts table
+        counts = slide_results.organism_counts or {}
+        grades = {}
+        if slide_results.severity_grades is not None:
+            grades = {
+                cls: grade.value
+                for cls, grade in slide_results.severity_grades.items()
+            }
+
+        self._populate_counts_table(counts, grades)
+
+        # Update flagged fields placeholder
+        flagged = slide_results.flagged_field_ids or []
+        if flagged:
+            self._thumb_placeholder.setText(
+                f"[ {len(flagged)} flagged field(s) ]\n"
+                f"Field IDs: {', '.join(str(f) for f in flagged[:10])}"
+            )
+
     def _load_results(self, slide_id: int) -> None:
-        """Load and display results for a slide."""
+        """Load and display results from the database."""
         results = crud.get_results(self._ctx.db, slide_id)
 
         if not results:
+            # Check if we have live results in context
+            live_results = getattr(self._ctx, "last_slide_results", None)
+            if live_results and live_results.slide_id == slide_id:
+                self._display_slide_results(live_results)
+                return
+
             self._summary_label.setText(
                 "No AI results available. The scan may still be processing, "
                 "or AI inference was skipped."
@@ -142,8 +227,11 @@ class ResultsDashboardScreen(QWidget):
             return
 
         # Summary text
-        summary = results.get("plain_english_summary", "Results available — see table below.")
-        self._summary_label.setText(summary)
+        summary = results.get("plain_english_summary")
+        if summary:
+            self._summary_label.setText(summary)
+        else:
+            self._summary_label.setText("Scan complete — see table below for details.")
 
         severity = results.get("severity_score", "0")
         self._severity_label.setText(f"Overall severity: {severity}")
@@ -151,7 +239,16 @@ class ResultsDashboardScreen(QWidget):
         # Organism counts table
         counts = results.get("organism_counts", {})
         grades = results.get("severity_grades", {})
+        self._populate_counts_table(counts, grades)
 
+        logger.debug("Results loaded for slide %d: %d organism classes", slide_id, len(counts))
+
+    def _populate_counts_table(
+        self,
+        counts: dict[str, int],
+        grades: dict[str, str],
+    ) -> None:
+        """Fill the organism counts table."""
         self._counts_table.setRowCount(len(counts))
         for row, (organism, count) in enumerate(sorted(counts.items())):
             self._counts_table.setItem(row, 0, QTableWidgetItem(organism.replace("_", " ").title()))
@@ -160,5 +257,3 @@ class ResultsDashboardScreen(QWidget):
             grade_item = QTableWidgetItem(grade)
             grade_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self._counts_table.setItem(row, 2, grade_item)
-
-        logger.debug("Results loaded for slide %d: %d organism classes", slide_id, len(counts))
