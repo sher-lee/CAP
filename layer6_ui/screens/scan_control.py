@@ -1,9 +1,11 @@
-
 """
 Screen 3: Scan Control Panel
 ===============================
 Start/pause/stop controls, live progress bar, ETA,
 stage position map, and camera preview placeholder.
+
+Wired to ScanWorker (scan pipeline) and InferenceWorker
+(AI inference after scan completes).
 """
 
 from __future__ import annotations
@@ -35,6 +37,8 @@ class ScanControlScreen(QWidget):
         self._nav = nav_signals
         self._is_scanning = False
         self._is_paused = False
+        self._scan_worker = None
+        self._inference_worker = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -215,22 +219,34 @@ class ScanControlScreen(QWidget):
                 f"Region defined with {len(region_count)} vertices. Press Start to begin."
             )
 
+    # -------------------------------------------------------------------
+    # Scan lifecycle
+    # -------------------------------------------------------------------
+
     def _on_start(self) -> None:
         """Start or resume the scan."""
         if self._is_paused:
+            # Resume existing scan
             self._is_paused = False
             self._status_label.setText("Scanning...")
             self._pause_btn.setText("⏸  Pause")
+            if self._scan_worker:
+                self._scan_worker.request_resume()
             logger.info("Scan resumed")
         else:
+            # Start new scan
             self._is_scanning = True
             self._status_label.setText("Scanning...")
             self._status_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #1D9E75;")
             self._detail_label.setText("Scan in progress — do not disturb the microscope")
-            logger.info("Scan started")
 
-            # TODO: Emit scan_start signal to worker thread
-            # self._scan_signals.scan_start_requested.emit(scan_region)
+            # Reset progress
+            self._progress_bar.setValue(0)
+            self._progress_bar.setFormat("0 / 0 fields (0%)")
+
+            # Launch scan worker
+            self._start_scan_worker()
+            logger.info("Scan started")
 
         self._start_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)
@@ -246,6 +262,8 @@ class ScanControlScreen(QWidget):
         self._start_btn.setText("▶  Resume")
         self._pause_btn.setText("⏸  Paused")
         self._pause_btn.setEnabled(False)
+        if self._scan_worker:
+            self._scan_worker.request_pause()
         logger.info("Scan paused")
 
     def _on_stop(self) -> None:
@@ -261,6 +279,8 @@ class ScanControlScreen(QWidget):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
+            if self._scan_worker:
+                self._scan_worker.request_stop()
             self._is_scanning = False
             self._is_paused = False
             self._status_label.setText("Scan stopped")
@@ -271,6 +291,152 @@ class ScanControlScreen(QWidget):
             self._stop_btn.setEnabled(False)
             self._results_btn.setEnabled(True)
             logger.info("Scan stopped by user")
+
+    # -------------------------------------------------------------------
+    # Worker management
+    # -------------------------------------------------------------------
+
+    def _start_scan_worker(self) -> None:
+        """Create and start the scan worker thread."""
+        from cap.workers.scan_worker import ScanWorker
+
+        region_vertices = getattr(self._ctx, "current_scan_region_vertices", [])
+        if not region_vertices:
+            QMessageBox.warning(
+                self, "No Scan Region",
+                "No scan region defined. Go back and draw a region first.",
+            )
+            return
+
+        self._scan_worker = ScanWorker(self._ctx, region_vertices)
+
+        # Connect scan signals
+        self._scan_worker.scan_signals.progress.connect(self._on_scan_progress)
+        self._scan_worker.scan_signals.scan_complete.connect(self._on_scan_complete)
+        self._scan_worker.scan_signals.scan_failed.connect(self._on_scan_failed)
+
+        # Connect focus signals
+        self._scan_worker.focus_signals.preliminary_focus_started.connect(
+            lambda: self._detail_label.setText("Running preliminary focus...")
+        )
+        self._scan_worker.focus_signals.preliminary_focus_complete.connect(
+            lambda _: self._detail_label.setText("Focus map complete — scanning fields...")
+        )
+        self._scan_worker.focus_signals.preliminary_focus_failed.connect(
+            lambda msg: self._on_scan_failed(f"Focus failed: {msg}")
+        )
+
+        self._scan_worker.start()
+        logger.info("ScanWorker thread started")
+
+    def _start_inference_worker(self) -> None:
+        """Create and start the inference worker thread after scan completes."""
+        from cap.workers.inference_worker import InferenceWorker
+
+        self._inference_worker = InferenceWorker(self._ctx)
+
+        self._inference_worker.signals.inference_started.connect(
+            lambda _: self._detail_label.setText("Running AI inference...")
+        )
+        self._inference_worker.signals.inference_progress.connect(
+            self._on_inference_progress
+        )
+        self._inference_worker.signals.inference_complete.connect(
+            self._on_inference_complete
+        )
+        self._inference_worker.signals.inference_skipped.connect(
+            self._on_inference_skipped
+        )
+        self._inference_worker.signals.inference_failed.connect(
+            self._on_inference_failed
+        )
+
+        self._inference_worker.start()
+        logger.info("InferenceWorker thread started")
+
+    # -------------------------------------------------------------------
+    # Signal handlers
+    # -------------------------------------------------------------------
+
+    def _on_scan_progress(self, progress) -> None:
+        """Handle ScanProgress from the scan worker."""
+        self.update_progress(
+            progress.fields_completed,
+            progress.fields_total,
+            progress.eta_seconds,
+        )
+        self._detail_label.setText(progress.current_field_status)
+
+    def _on_scan_complete(self, slide_id: int) -> None:
+        """Handle scan completion — update UI and start inference."""
+        self._is_scanning = False
+        self._status_label.setText("Scan complete — running AI analysis...")
+        self._status_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #1D9E75;")
+        self._detail_label.setText("All fields captured. Starting AI inference...")
+        self._start_btn.setEnabled(False)
+        self._pause_btn.setEnabled(False)
+        self._stop_btn.setEnabled(False)
+        self._progress_bar.setValue(self._progress_bar.maximum())
+        logger.info("Scan complete for slide %d — starting inference", slide_id)
+
+        # Auto-start inference
+        self._start_inference_worker()
+
+    def _on_scan_failed(self, error_msg: str) -> None:
+        """Handle scan failure."""
+        self._is_scanning = False
+        self._status_label.setText("Scan failed")
+        self._status_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #E24B4A;")
+        self._detail_label.setText(f"Error: {error_msg}")
+        self._start_btn.setEnabled(True)
+        self._start_btn.setText("▶  Start Scan")
+        self._pause_btn.setEnabled(False)
+        self._stop_btn.setEnabled(False)
+        logger.error("Scan failed: %s", error_msg)
+
+        QMessageBox.critical(self, "Scan Failed", f"The scan encountered an error:\n\n{error_msg}")
+
+    def _on_inference_progress(self, done: int, total: int) -> None:
+        """Handle inference progress updates."""
+        self._detail_label.setText(f"AI inference: {done} / {total} fields processed")
+
+    def _on_inference_complete(self, slide_id: int, slide_results) -> None:
+        """Handle inference completion."""
+        self._status_label.setText("Analysis complete!")
+        severity = "N/A"
+        if slide_results.overall_severity is not None:
+            severity = slide_results.overall_severity.value
+        self._detail_label.setText(
+            f"AI analysis complete — overall severity: {severity}. "
+            f"View results or proceed to review."
+        )
+        self._results_btn.setEnabled(True)
+        logger.info("Inference complete for slide %d: severity=%s", slide_id, severity)
+
+    def _on_inference_skipped(self, reason: str) -> None:
+        """Handle inference being skipped (AI-disabled mode)."""
+        self._status_label.setText("Scan complete!")
+        self._detail_label.setText(
+            f"AI inference skipped ({reason}). "
+            f"Images captured successfully — view results."
+        )
+        self._results_btn.setEnabled(True)
+        logger.info("Inference skipped: %s", reason)
+
+    def _on_inference_failed(self, error_msg: str) -> None:
+        """Handle inference failure (scan still succeeded)."""
+        self._status_label.setText("Scan complete (AI failed)")
+        self._status_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #BA7517;")
+        self._detail_label.setText(
+            f"Scan completed but AI analysis failed: {error_msg}. "
+            f"Images are still available for review."
+        )
+        self._results_btn.setEnabled(True)
+        logger.error("Inference failed: %s", error_msg)
+
+    # -------------------------------------------------------------------
+    # Progress display (also callable directly for testing)
+    # -------------------------------------------------------------------
 
     def update_progress(self, fields_done: int, fields_total: int, eta_sec: float) -> None:
         """
@@ -296,14 +462,8 @@ class ScanControlScreen(QWidget):
             self._eta_label.setText(f"ETA: {eta_sec / 60:.1f} min")
 
     def on_scan_complete(self) -> None:
-        """Called when scan finishes successfully."""
-        self._is_scanning = False
-        self._status_label.setText("Scan complete!")
-        self._status_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #1D9E75;")
-        self._detail_label.setText("All fields captured. View results or proceed to review.")
-        self._start_btn.setEnabled(False)
-        self._pause_btn.setEnabled(False)
-        self._stop_btn.setEnabled(False)
-        self._results_btn.setEnabled(True)
-        self._progress_bar.setValue(self._progress_bar.maximum())
-        logger.info("Scan complete — UI updated")
+        """
+        Legacy method kept for backwards compatibility.
+        The signal-based _on_scan_complete is now the primary handler.
+        """
+        self._on_scan_complete(getattr(self._ctx, "current_slide_id", 0))
