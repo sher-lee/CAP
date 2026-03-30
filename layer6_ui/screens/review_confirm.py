@@ -1,10 +1,12 @@
-
 """
 Screen 5: Review and Confirm
 ===============================
 Technician reviews AI findings. Accept, reject, or modify
 individual detections. Add notes and confirm final diagnosis.
 Corrections are logged for the retraining pipeline.
+
+On confirmation, triggers ReportWorker to generate PDF and
+transfer to the exam room.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ class ReviewConfirmScreen(QWidget):
         self._ctx = app_context
         self._nav = nav_signals
         self._detections: list[dict] = []
+        self._report_worker = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -98,6 +101,13 @@ class ReviewConfirmScreen(QWidget):
 
         layout.addWidget(notes_group)
 
+        # Report status label (hidden until report generation starts)
+        self._report_status = QLabel("")
+        self._report_status.setStyleSheet("font-size: 13px; color: #1D9E75; font-weight: bold;")
+        self._report_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._report_status.setVisible(False)
+        layout.addWidget(self._report_status)
+
         # Bottom buttons
         btn_layout = QHBoxLayout()
 
@@ -114,6 +124,7 @@ class ReviewConfirmScreen(QWidget):
             "QPushButton { background-color: #1D9E75; color: white; font-size: 16px; "
             "font-weight: bold; border-radius: 6px; padding: 8px 24px; }"
             "QPushButton:hover { background-color: #0F6E56; }"
+            "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
         )
         self._confirm_btn.clicked.connect(self._on_confirm)
         btn_layout.addWidget(self._confirm_btn)
@@ -166,7 +177,11 @@ class ReviewConfirmScreen(QWidget):
             # Status
             self._det_table.setItem(row, 5, QTableWidgetItem("Pending"))
 
-        self._det_count_label.setText(f"{len(self._detections)} detections to review")
+        if self._detections:
+            self._det_count_label.setText(f"{len(self._detections)} detections to review")
+        else:
+            self._det_count_label.setText("No detections — AI may have been disabled")
+
         logger.debug("Loaded %d detections for review", len(self._detections))
 
     def _accept_row(self, row: int) -> None:
@@ -182,7 +197,7 @@ class ReviewConfirmScreen(QWidget):
         logger.info("All detections accepted")
 
     def _on_confirm(self) -> None:
-        """Confirm all reviews and generate report."""
+        """Confirm all reviews and trigger report generation."""
         slide_id = getattr(self._ctx, "current_slide_id", None)
         tech_id = getattr(self._ctx, "current_tech_id", None)
 
@@ -231,14 +246,64 @@ class ReviewConfirmScreen(QWidget):
             slide_id, corrections_count,
         )
 
+        # Disable confirm button while report generates
+        self._confirm_btn.setEnabled(False)
+        self._confirm_btn.setText("Generating report...")
+
+        # Start report generation
+        self._start_report_worker(notes)
+
+    def _start_report_worker(self, notes: str) -> None:
+        """Create and start the report worker thread."""
+        from cap.workers.report_worker import ReportWorker
+
+        self._report_worker = ReportWorker(self._ctx, technician_notes=notes)
+
+        self._report_worker.report_started.connect(
+            lambda: self._show_report_status("Generating report...")
+        )
+        self._report_worker.report_progress.connect(self._show_report_status)
+        self._report_worker.report_complete.connect(self._on_report_complete)
+        self._report_worker.report_failed.connect(self._on_report_failed)
+
+        self._report_worker.start()
+        logger.info("ReportWorker thread started")
+
+    def _show_report_status(self, message: str) -> None:
+        """Show report generation progress."""
+        self._report_status.setText(message)
+        self._report_status.setVisible(True)
+
+    def _on_report_complete(self, pdf_path: str) -> None:
+        """Handle successful report generation."""
+        self._report_status.setText(f"Report saved: {pdf_path}")
+        self._confirm_btn.setText("Confirm and Generate Report")
+        self._confirm_btn.setEnabled(True)
+
+        logger.info("Report generated: %s", pdf_path)
+
         QMessageBox.information(
             self,
-            "Results Confirmed",
-            f"Results have been confirmed.\n\n"
-            f"Corrections logged: {corrections_count}\n"
-            f"Report generation: coming soon\n\n"
+            "Report Generated",
+            f"Results have been confirmed and the report has been generated.\n\n"
+            f"Report: {pdf_path}\n\n"
             f"You can start a new scan or view patient history.",
         )
 
-        # TODO: Trigger PDF report generation
-        # TODO: Trigger exam room transfer
+    def _on_report_failed(self, error_msg: str) -> None:
+        """Handle report generation failure."""
+        self._report_status.setText(f"Report failed: {error_msg}")
+        self._report_status.setStyleSheet(
+            "font-size: 13px; color: #E24B4A; font-weight: bold;"
+        )
+        self._confirm_btn.setText("Confirm and Generate Report")
+        self._confirm_btn.setEnabled(True)
+
+        logger.error("Report generation failed: %s", error_msg)
+
+        QMessageBox.warning(
+            self,
+            "Report Failed",
+            f"Results were confirmed but report generation failed:\n\n{error_msg}\n\n"
+            f"You can try again or continue without a report.",
+        )
