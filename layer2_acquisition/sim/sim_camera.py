@@ -7,17 +7,27 @@ synthetic microscopy patterns if no test images are available.
 
 Supports the same public API as the real camera so the capture
 sequencer works identically in both modes.
+
+Continuous-mode extensions:
+  - `capture_one()` — explicit single-frame trigger (alias for
+    trigger_capture, named to match the controller's API).
+  - `set_position_provider(callable)` — register a callback that
+    returns (x_um, y_um, z_um) for the camera's current pose. When set
+    and no on-disk test images are available, the synthetic frame is
+    rendered by WorldTexture using that pose, so adjacent fields share
+    overlap content and Z affects focus realistically.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 
 from cap.common.logging_setup import get_logger
+from cap.layer2_acquisition.sim.world_texture import WorldTexture, WorldTextureConfig
 
 logger = get_logger("camera.sim")
 
@@ -49,12 +59,26 @@ class SimCameraInterface:
             self._height = sim.get("synthetic_image_height", 2160)
             self._bit_depth = cam.get("bit_depth", 10)
 
+        # FOV in microns (from camera config) — used by WorldTexture to
+        # convert FOV ↔ pixels. Defaults match cap_config.yaml.
+        if hasattr(config, "camera"):
+            self._fov_w_um = config.camera.fov_width_mm * 1000.0
+            self._fov_h_um = config.camera.fov_height_mm * 1000.0
+        else:
+            cam = config.get("camera", {})
+            self._fov_w_um = cam.get("fov_width_mm", 0.007) * 1000.0
+            self._fov_h_um = cam.get("fov_height_mm", 0.004) * 1000.0
+
         self._is_connected = False
         self._exposure = 10000
         self._gain = 0.0
         self._white_balance = (1.0, 1.0, 1.0)
         self._frame_counter = 0
         self._test_images: list[np.ndarray] = []
+
+        # Continuous-mode position-aware rendering. None = legacy behavior.
+        self._position_provider: Optional[Callable[[], Tuple[float, float, float]]] = None
+        self._world_texture: Optional[WorldTexture] = None
 
         logger.info(
             "SimCameraInterface initialized: %dx%d, %d-bit, test_dir=%s",
@@ -100,6 +124,32 @@ class SimCameraInterface:
         self._white_balance = (r, g, b)
         logger.debug("White balance set to R=%.2f G=%.2f B=%.2f", r, g, b)
 
+    # ----- Continuous-mode hookup -----
+
+    def set_position_provider(
+        self,
+        provider: Optional[Callable[[], Tuple[float, float, float]]],
+        texture_config: Optional[WorldTextureConfig] = None,
+    ) -> None:
+        """
+        Register a callable that returns (x_um, y_um, z_um) for the camera's
+        current pose. When set, capture_one() / trigger_capture() render
+        position-aware frames via WorldTexture. Pass None to disable.
+
+        Calling with no on-disk test images present is the normal mode.
+        If test images are loaded, they take precedence (legacy behavior).
+        """
+        self._position_provider = provider
+        if provider is None:
+            self._world_texture = None
+        else:
+            self._world_texture = WorldTexture(texture_config)
+        logger.debug("Position provider %s", "set" if provider else "cleared")
+
+    @property
+    def world_texture(self) -> Optional[WorldTexture]:
+        return self._world_texture
+
     # ----- Capture -----
 
     def trigger_capture(self) -> np.ndarray:
@@ -118,13 +168,33 @@ class SimCameraInterface:
         if self._test_images:
             # Cycle through loaded test images
             frame = self._test_images[self._frame_counter % len(self._test_images)]
+            frame = frame.copy()
+        elif self._position_provider is not None and self._world_texture is not None:
+            x_um, y_um, z_um = self._position_provider()
+            px_per_um = self._width / max(self._fov_w_um, 1e-9)
+            frame = self._world_texture.render_frame(
+                x_um_center=x_um,
+                y_um_center=y_um,
+                z_um=z_um,
+                width_px=self._width,
+                height_px=self._height,
+                px_per_um=px_per_um,
+                bit_depth=self._bit_depth,
+            )
         else:
-            # Generate synthetic frame
+            # Generate synthetic frame (legacy: position-unaware)
             frame = self._generate_synthetic_frame()
 
         self._frame_counter += 1
         logger.debug("Frame captured (simulated): #%d", self._frame_counter)
-        return frame.copy()
+        return frame
+
+    def capture_one(self) -> np.ndarray:
+        """
+        Synchronous single-frame trigger — the API the
+        ContinuousScanController expects. Equivalent to trigger_capture().
+        """
+        return self.trigger_capture()
 
     def get_frame_buffer(self) -> Optional[np.ndarray]:
         """

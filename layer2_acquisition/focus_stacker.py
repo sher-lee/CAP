@@ -59,6 +59,7 @@ class FocusStacker:
         slide_id: int = 0,
         field_x: int = 0,
         field_y: int = 0,
+        expected_shifts_px: Optional[list[tuple[float, float]]] = None,
     ) -> StackedField:
         """
         Produce a focus-stacked composite from a list of Z-depth frames.
@@ -73,6 +74,14 @@ class FocusStacker:
             For metadata tracking.
         field_x, field_y : int
             Motor coordinates for metadata.
+        expected_shifts_px : list of (dx, dy) or None
+            Optional per-frame translation prior in pixels, same length as
+            `frames`, with frames[0] at (0.0, 0.0). Provided by continuous
+            scanning (where stage motion during one Z-stack produces
+            multi-hundred-pixel shifts that exceed max_registration_shift).
+            When supplied, the stacker pre-warps each frame by its prior
+            and phase-correlates around zero for sub-pixel residual only.
+            When None (stop-and-go), behavior is unchanged.
 
         Returns
         -------
@@ -109,7 +118,10 @@ class FocusStacker:
                 gray_frames.append(f.astype(np.float64))
 
         # Step 2: Register frames to frame 0 via phase correlation
-        aligned_frames, aligned_grays, shifts = self._register_frames(frames, gray_frames)
+        # (with optional step-counter prior for continuous-mode capture)
+        aligned_frames, aligned_grays, shifts = self._register_frames(
+            frames, gray_frames, expected_shifts_px,
+        )
 
         # Step 3: Per-block sharpness evaluation
         bs = self._block_size
@@ -209,54 +221,68 @@ class FocusStacker:
         self,
         frames: list[np.ndarray],
         gray_frames: list[np.ndarray],
+        expected_shifts_px: Optional[list[tuple[float, float]]] = None,
     ) -> tuple[list[np.ndarray], list[np.ndarray], list[tuple[float, float]]]:
         """
-        Register frames 1..N to frame 0 using phase correlation.
+        Register frames 1..N to frame 0.
 
-        Returns aligned frames, aligned grays, and the computed shifts.
+        Two paths:
+
+        **Stop-and-go (no prior):** phase-correlate each frame against
+        frame 0 directly. Reject shifts beyond max_registration_shift
+        (likely a capture error) and fall back to unregistered.
+
+        **Continuous (prior given):** pre-warp frame i by its prior shift,
+        phase-correlate the pre-warped version against frame 0 for the
+        residual (which should be sub-pixel), and combine prior + residual
+        for the final translation. The max_shift threshold applies to the
+        residual only — large priors are expected and OK.
+
+        Returns aligned frames, aligned grays, and the final shifts used.
         """
         n = len(frames)
         ref_gray = gray_frames[0]
 
+        if expected_shifts_px is not None and len(expected_shifts_px) != n:
+            logger.warning(
+                "expected_shifts_px length (%d) != frames length (%d); ignoring prior",
+                len(expected_shifts_px), n,
+            )
+            expected_shifts_px = None
+
         aligned_frames = [frames[0]]
         aligned_grays = [gray_frames[0]]
         shifts: list[tuple[float, float]] = []
+        if expected_shifts_px is not None:
+            # Record (0, 0) for frame 0 to keep the shifts list parallel to frames
+            # in continuous mode. Stop-and-go skips this for backward compat.
+            shifts.append((0.0, 0.0))
 
         for i in range(1, n):
-            # Phase correlation returns (dx, dy) sub-pixel shift
             try:
-                shift, response = cv2.phaseCorrelate(ref_gray, gray_frames[i])
-                dx, dy = shift
-
-                # Check if shift is reasonable
-                if abs(dx) > self._max_shift or abs(dy) > self._max_shift:
-                    logger.warning(
-                        "Frame %d: registration shift (%.1f, %.1f) exceeds max (%d) — "
-                        "using unregistered frame",
-                        i, dx, dy, self._max_shift,
+                if expected_shifts_px is None:
+                    final_shift = self._register_one_no_prior(ref_gray, gray_frames[i], i)
+                else:
+                    final_shift = self._register_one_with_prior(
+                        ref_gray, gray_frames[i], expected_shifts_px[i], i,
                     )
+
+                # If registration failed entirely, append the frame untouched
+                if final_shift is None:
                     aligned_frames.append(frames[i])
                     aligned_grays.append(gray_frames[i])
-                    shifts.append((dx, dy))
+                    shifts.append((0.0, 0.0))
                     continue
 
-                # Apply sub-pixel shift via affine warp
+                dx, dy = final_shift
                 h, w = frames[i].shape[:2]
                 M = np.float64([[1, 0, dx], [0, 1, dy]])
 
-                if frames[i].ndim == 3:
-                    aligned = cv2.warpAffine(
-                        frames[i], M, (w, h),
-                        flags=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_REPLICATE,
-                    )
-                else:
-                    aligned = cv2.warpAffine(
-                        frames[i], M, (w, h),
-                        flags=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_REPLICATE,
-                    )
-
+                aligned = cv2.warpAffine(
+                    frames[i], M, (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
                 aligned_gray = cv2.warpAffine(
                     gray_frames[i], M, (w, h),
                     flags=cv2.INTER_LINEAR,
@@ -269,7 +295,7 @@ class FocusStacker:
 
             except Exception as e:
                 logger.warning(
-                    "Frame %d: phase correlation failed (%s) — using unregistered",
+                    "Frame %d: registration failed (%s) — using unregistered",
                     i, e,
                 )
                 aligned_frames.append(frames[i])
@@ -277,6 +303,62 @@ class FocusStacker:
                 shifts.append((0.0, 0.0))
 
         return aligned_frames, aligned_grays, shifts
+
+    def _register_one_no_prior(
+        self,
+        ref_gray: np.ndarray,
+        gray_i: np.ndarray,
+        i: int,
+    ) -> Optional[tuple[float, float]]:
+        """Stop-and-go registration: direct phase correlation, max_shift gate."""
+        shift, _ = cv2.phaseCorrelate(ref_gray, gray_i)
+        dx, dy = shift
+        if abs(dx) > self._max_shift or abs(dy) > self._max_shift:
+            logger.warning(
+                "Frame %d: registration shift (%.1f, %.1f) exceeds max (%d) — "
+                "using unregistered frame",
+                i, dx, dy, self._max_shift,
+            )
+            return None
+        return (dx, dy)
+
+    def _register_one_with_prior(
+        self,
+        ref_gray: np.ndarray,
+        gray_i: np.ndarray,
+        prior: tuple[float, float],
+        i: int,
+    ) -> Optional[tuple[float, float]]:
+        """
+        Continuous-mode registration: pre-warp by prior, phase-correlate
+        for sub-pixel residual, combine.
+        """
+        prior_dx, prior_dy = prior
+        h, w = gray_i.shape[:2]
+
+        # Pre-warp frame i by its prior into frame 0's coordinate system.
+        M_prior = np.float64([[1, 0, prior_dx], [0, 1, prior_dy]])
+        prewarp = cv2.warpAffine(
+            gray_i, M_prior, (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+        # Residual phase correlation should now be sub-pixel.
+        residual, _ = cv2.phaseCorrelate(ref_gray, prewarp)
+        rx, ry = residual
+
+        if abs(rx) > self._max_shift or abs(ry) > self._max_shift:
+            # Residual too large: priors don't seem trustworthy, or content
+            # genuinely shifted (e.g. partial obstruction). Use prior only.
+            logger.warning(
+                "Frame %d: residual shift (%.1f, %.1f) after prior (%.1f, %.1f) "
+                "exceeds max (%d) — using prior alone",
+                i, rx, ry, prior_dx, prior_dy, self._max_shift,
+            )
+            return (prior_dx, prior_dy)
+
+        return (prior_dx + rx, prior_dy + ry)
 
     # ----- Sharpness -----
 

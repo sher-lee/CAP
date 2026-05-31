@@ -133,6 +133,23 @@ class ScanConfig:
 
 
 @dataclass
+class ContinuousScanConfig:
+    """Settings for the continuous-scan path. Used when enabled=True;
+    otherwise the system follows the stop-and-go ScanConfig path."""
+    enabled: bool = False
+    target_fields_per_second: float = 7.0
+    frames_per_field: int = 6
+    z_cycle_range_um: float = 2.5
+    z_cycle_waveform: str = "triangle"
+    z_tracking_enabled: bool = True
+    step_counter_prior_only: bool = False
+    flat_field_correction: bool = False
+    retry_strategy: str = "per_scan_line"
+    max_x_drift_per_stack_um: float = 3.0
+    brightness_check_every_n_frames: int = 1
+
+
+@dataclass
 class ProcessingConfig:
     noise_filter_type: str = "gaussian"
     noise_filter_kernel: int = 3
@@ -245,6 +262,7 @@ class CAPConfig:
     scan_region: ScanRegionConfig = field(default_factory=ScanRegionConfig)
     slide: SlideConfig = field(default_factory=SlideConfig)
     scan: ScanConfig = field(default_factory=ScanConfig)
+    continuous_scan: ContinuousScanConfig = field(default_factory=ContinuousScanConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
@@ -354,6 +372,7 @@ def _build_config(raw: dict) -> CAPConfig:
         scan_region=_build_section(ScanRegionConfig, raw.get("scan_region", {})),
         slide=_build_section(SlideConfig, raw.get("slide", {})),
         scan=_build_section(ScanConfig, raw.get("scan", {})),
+        continuous_scan=_build_section(ContinuousScanConfig, raw.get("continuous_scan", {})),
         processing=_build_section(ProcessingConfig, raw.get("processing", {})),
         inference=_build_section(InferenceConfig, raw.get("inference", {})),
         storage=_build_section(StorageConfig, raw.get("storage", {})),

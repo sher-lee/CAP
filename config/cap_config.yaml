@@ -130,6 +130,30 @@ scan:
 
 
 # ---------------------------------------------------------------------------
+# Continuous scanning (Layer 1 + Layer 2)
+# ---------------------------------------------------------------------------
+# The continuous-scan path moves X at constant velocity, oscillates Z
+# through z_depths_per_field positions per FOV-width of X travel, and
+# tags every captured frame with (x_um, y_um, z_um) from open-loop step
+# counts. Frames are grouped into virtual fields post-capture.
+#
+# All values here are starting points. They become load-bearing during
+# Phase 10 (hardware bring-up); tune empirically.
+continuous_scan:
+  enabled: false                          # When false, the system uses the stop-and-go path
+  target_fields_per_second: 7             # Sets x_velocity = fov_width × this
+  frames_per_field: 6                     # Exactly N frames per field (one per Z-depth)
+  z_cycle_range_um: 2.5                   # Total Z sweep range (±range/2 from center)
+  z_cycle_waveform: triangle              # "triangle" or "sawtooth" — triangle = lower wear
+  z_tracking_enabled: true                # Z-cycle center follows preliminary focus surface
+  step_counter_prior_only: false          # If true, skip cross-correlation refinement at overlaps
+  flat_field_correction: false            # If true, normalize per-frame illumination before stacking
+  retry_strategy: per_scan_line           # "per_scan_line" or "per_field" (per-field requires retrace)
+  max_x_drift_per_stack_um: 3.0           # Sanity check; flag fields whose 6 frames span more than this
+  brightness_check_every_n_frames: 1      # Per-frame oil safety check (1 = every frame)
+
+
+# ---------------------------------------------------------------------------
 # Image processing (Layer 3)
 # ---------------------------------------------------------------------------
 processing:

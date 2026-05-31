@@ -96,9 +96,13 @@ class RawFrame:
     """
     slide_id: int
     field_x: int
-    """X grid coordinate of this field in the scan region."""
+    """X grid coordinate of this field in the scan region.
+    In continuous mode, set to -1 at capture time and assigned by the
+    frame grouper once the frame is bound to a virtual field."""
     field_y: int
-    """Y grid coordinate of this field in the scan region."""
+    """Y grid coordinate of this field in the scan region.
+    In continuous mode, set to -1 at capture time and assigned by the
+    frame grouper once the frame is bound to a virtual field."""
     z_depth: int
     """Z-depth index (0–5 for 6-depth capture)."""
     timestamp: float
@@ -106,7 +110,18 @@ class RawFrame:
     bayer_data: np.ndarray
     """Raw Bayer frame, shape (H, W), dtype uint8 (RG8) or uint16 (RG10)."""
     motor_position: tuple[int, int, int]
-    """Actual motor position (x, y, z) in microsteps at time of capture."""
+    """Actual motor position (x, y, z) in microsteps at time of capture.
+    In continuous mode this is the source of truth for spatial position;
+    field_x / field_y are derived from it post-capture."""
+
+    # Continuous-mode fields (default values keep stop-and-go callers unaffected)
+    frame_id: int = -1
+    """Sequential capture index across the whole scan. -1 in stop-and-go mode."""
+    scan_line: int = -1
+    """Serpentine scan-line index (Y row). -1 in stop-and-go mode."""
+    scan_direction: int = 0
+    """Serpentine direction along X for this scan line: +1, -1, or 0
+    (0 = stop-and-go / not applicable)."""
 
 
 # ---------------------------------------------------------------------------

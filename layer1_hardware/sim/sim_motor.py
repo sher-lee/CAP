@@ -5,9 +5,26 @@ Drop-in replacement for the real MotorController. Tracks X, Y, Z
 positions in memory. No GPIO, no real motors. Enforces software
 boundary limits and optionally simulates movement delay.
 
-Implements the same public interface as the real MotorController
-so all upstream code (ScanRegionManager, CaptureSequencer, UI)
-works identically in simulation and real modes.
+Implements the same public interface as the real MotorController so
+all upstream code (ScanRegionManager, CaptureSequencer, UI) works
+identically in simulation and real modes.
+
+Also implements the continuous-scan primitives that
+ContinuousScanController requires:
+
+    start_constant_velocity(axis, velocity_steps_per_sec)
+    stop_axis(axis)
+    move_to_blocking(axis, target_steps)
+    read_position_snapshot()
+
+Time-aware position model: each axis tracks (position_at_anchor,
+velocity_steps_per_sec, anchor_time). When velocity != 0, reads
+compute the live position as:
+
+    pos_now = pos_anchor + velocity * (time.monotonic() - anchor_time)
+
+so that X keeps advancing while a Z move_to_blocking sleeps, exactly
+as it would on real hardware.
 """
 
 from __future__ import annotations
@@ -16,6 +33,7 @@ import time
 from typing import Optional
 
 from cap.common.logging_setup import get_logger
+from cap.layer2_acquisition.frame_tagger import PositionSnapshot
 
 logger = get_logger("motor.sim")
 
@@ -59,10 +77,15 @@ class SimMotorController:
             sim = config.get("sim", {})
             self._sim_delay_ms = sim.get("motor_delay_ms", 10)
 
-        # Current position (microsteps)
-        self._x: int = 0
-        self._y: int = 0
-        self._z: int = 0
+        # Per-axis time-aware position. Each axis stores (anchor_pos,
+        # anchor_time, velocity). When velocity is 0 the live position is
+        # just anchor_pos. When velocity != 0, live position is
+        # anchor_pos + velocity * (now - anchor_time). Discrete moves
+        # update the anchor and zero the velocity.
+        now = time.monotonic()
+        self._anchor_pos: dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self._anchor_time: dict[str, float] = {"x": now, "y": now, "z": now}
+        self._velocity: dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
 
         # State
         self._homed: bool = False
@@ -138,7 +161,7 @@ class SimMotorController:
 
     def get_position_xyz(self) -> tuple[int, int, int]:
         """Return current position of all axes as (x, y, z)."""
-        return (self._x, self._y, self._z)
+        return (self._get_axis("x"), self._get_axis("y"), self._get_axis("z"))
 
     # ----- Homing -----
 
@@ -205,25 +228,120 @@ class SimMotorController:
         if delay_sec > 0:
             time.sleep(delay_sec)
 
+    # ----- Continuous-mode primitives -----
+
+    def start_constant_velocity(self, axis: str, velocity_steps_per_sec: float) -> None:
+        """
+        Begin moving an axis at constant velocity (microsteps/sec).
+        Returns immediately — subsequent reads compute live position.
+
+        velocity_steps_per_sec may be negative (reverse direction). A value
+        of 0 stops the axis (equivalent to stop_axis).
+        """
+        self._check_estop()
+        axis = axis.lower()
+        if axis not in ("x", "y", "z"):
+            raise ValueError(f"Invalid axis: '{axis}'")
+
+        # Freeze current live position before changing velocity, so the
+        # transition is continuous (no jump).
+        live = self._live_position(axis)
+        self._anchor_pos[axis] = live
+        self._anchor_time[axis] = time.monotonic()
+        self._velocity[axis] = float(velocity_steps_per_sec)
+
+        logger.debug(
+            "start_constant_velocity(%s, %.2f steps/sec) — anchor=%.2f",
+            axis, velocity_steps_per_sec, live,
+        )
+
+    def stop_axis(self, axis: str) -> None:
+        """Stop an axis at its current live position. Idempotent."""
+        axis = axis.lower()
+        if axis not in ("x", "y", "z"):
+            raise ValueError(f"Invalid axis: '{axis}'")
+        live = self._live_position(axis)
+        self._anchor_pos[axis] = live
+        self._anchor_time[axis] = time.monotonic()
+        self._velocity[axis] = 0.0
+        logger.debug("stop_axis(%s) — frozen at %.2f", axis, live)
+
+    def move_to_blocking(self, axis: str, target_steps: int) -> None:
+        """
+        Discrete blocking move to target position. Stops any constant-
+        velocity motion on this axis first. Other axes' motion is
+        unaffected. Identical to move_to() — provided as an explicit
+        name for the continuous-scan controller's API.
+        """
+        self.move_to(axis, target_steps)
+
+    def read_position_snapshot(self) -> PositionSnapshot:
+        """
+        Atomic snapshot of all three axes at the current instant.
+        Used by the FrameTagger to bind motor state to a captured frame.
+        """
+        now = time.monotonic()
+        return PositionSnapshot(
+            x_steps=int(round(self._live_position("x", at_time=now))),
+            y_steps=int(round(self._live_position("y", at_time=now))),
+            z_steps=int(round(self._live_position("z", at_time=now))),
+            timestamp=now,
+        )
+
     # ----- Internal helpers -----
 
+    def _live_position(self, axis: str, at_time: Optional[float] = None) -> float:
+        """
+        Compute the live position of an axis at `at_time` (default: now),
+        accounting for any active constant-velocity motion. Returns
+        microsteps as a float; integer rounding is the caller's choice.
+
+        Boundary clamp: if the live position would exceed the axis bounds,
+        the axis is auto-stopped at the bound. This mimics StallGuard
+        kicking in on real hardware.
+        """
+        v = self._velocity[axis]
+        if v == 0.0:
+            return self._anchor_pos[axis]
+
+        if at_time is None:
+            at_time = time.monotonic()
+        live = self._anchor_pos[axis] + v * (at_time - self._anchor_time[axis])
+
+        bounds = {
+            "x": (self._x_min, self._x_max),
+            "y": (self._y_min, self._y_max),
+            "z": (self._z_min, self._z_max),
+        }
+        lo, hi = bounds[axis]
+        if live < lo:
+            self._anchor_pos[axis] = float(lo)
+            self._anchor_time[axis] = at_time
+            self._velocity[axis] = 0.0
+            logger.warning("Axis %s hit lower bound %d during constant-velocity motion", axis, lo)
+            return float(lo)
+        if live > hi:
+            self._anchor_pos[axis] = float(hi)
+            self._anchor_time[axis] = at_time
+            self._velocity[axis] = 0.0
+            logger.warning("Axis %s hit upper bound %d during constant-velocity motion", axis, hi)
+            return float(hi)
+
+        return live
+
     def _get_axis(self, axis: str) -> int:
-        if axis == "x":
-            return self._x
-        elif axis == "y":
-            return self._y
-        elif axis == "z":
-            return self._z
-        else:
+        """Public reads return integer microsteps from the live position."""
+        if axis not in ("x", "y", "z"):
             raise ValueError(f"Invalid axis: '{axis}'. Must be 'x', 'y', or 'z'.")
+        return int(round(self._live_position(axis)))
 
     def _set_axis(self, axis: str, value: int) -> None:
-        if axis == "x":
-            self._x = value
-        elif axis == "y":
-            self._y = value
-        elif axis == "z":
-            self._z = value
+        """Discrete set: anchors the axis at value and zeros its velocity."""
+        if axis not in ("x", "y", "z"):
+            return
+        self._anchor_pos[axis] = float(value)
+        self._anchor_time[axis] = time.monotonic()
+        self._velocity[axis] = 0.0
 
     def _validate_position(self, axis: str, position: int) -> None:
         bounds = {
